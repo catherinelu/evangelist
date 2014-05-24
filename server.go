@@ -57,22 +57,44 @@ func getNumPages(pdfPath string) (int, error) {
 }
 
 /* See the documentation for `uploadAllJPEGsToS3`. This function does the
+ * same, except for a single page. */
+func uploadJPEGToS3(bucket *s3.Bucket, jpegPath string, s3JPEGPath string,
+    pageNum int) error {
+  jpegFile, err := os.Open(fmt.Sprintf(jpegPath, pageNum))
+  if err != nil { return err }
+
+  jpegFileInfo, err := jpegFile.Stat()
+  if err != nil { return err }
+
+  remoteJPEGPath := fmt.Sprintf(s3JPEGPath, pageNum)
+  err = bucket.PutReader(remoteJPEGPath, jpegFile, jpegFileInfo.Size(),
+    "image/jpeg", s3.PublicRead)
+  if err != nil { return err }
+
+  return nil
+}
+
+/* See the documentation for `uploadAllJPEGsToS3`. This function does the
  * same, except for a limited range of pages. */
 func uploadJPEGRangeToS3(wg *sync.WaitGroup, bucket *s3.Bucket,
     jpegPath string, s3JPEGPath string, firstPage int, lastPage int) error {
   defer wg.Done()
 
-  // upload JPEG corresponding to each page to S3
+  smallJPEGPath := strings.Replace(jpegPath, "%d", "%d-small", 1)
+  largeJPEGPath := strings.Replace(jpegPath, "%d", "%d-large", 1)
+
+  s3SmallJPEGPath := strings.Replace(s3JPEGPath, "%d", "%d-small", 1)
+  s3LargeJPEGPath := strings.Replace(s3JPEGPath, "%d", "%d-large", 1)
+
+  // upload JPEGs (small, normal, and large) corresponding to each page to S3
   for pageNum := firstPage; pageNum <= lastPage; pageNum = pageNum + 1 {
-    jpegFile, err := os.Open(fmt.Sprintf(jpegPath, pageNum))
+    err := uploadJPEGToS3(bucket, smallJPEGPath, s3SmallJPEGPath, pageNum)
     if err != nil { return err }
 
-    jpegFileInfo, err := jpegFile.Stat()
+    err = uploadJPEGToS3(bucket, jpegPath, s3JPEGPath, pageNum)
     if err != nil { return err }
 
-    remoteJPEGPath := fmt.Sprintf(s3JPEGPath, pageNum)
-    err = bucket.PutReader(remoteJPEGPath, jpegFile, jpegFileInfo.Size(),
-      "image/jpeg", s3.PublicRead)
+    err = uploadJPEGToS3(bucket, largeJPEGPath, s3LargeJPEGPath, pageNum)
     if err != nil { return err }
   }
 
@@ -128,10 +150,13 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
 /* Converts the PDF at `pdfPath` to JPEGs. Outputs the JPEGs to the provided
  * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
  * number). Converts pages within the range [`firstPage`, `lastPage`]. Calls
- * `wg.Done()` once finished. */
+ * `wg.Done()` once finished. Returns an error on the given channel. */
 func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
     firstPage int, lastPage int) {
   defer wg.Done()
+
+  smallJPEGPath := strings.Replace(jpegPath, "%d", "%d-small", 1)
+  largeJPEGPath := strings.Replace(jpegPath, "%d", "%d-large", 1)
 
   // use ghostscript for PDF -> JPEG conversion at 300 density
   for pageNum := firstPage; pageNum <= lastPage; pageNum = pageNum + 1 {
@@ -139,14 +164,73 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
     firstPageOption := fmt.Sprintf("-dFirstPage=%d", pageNum)
     lastPageOption := fmt.Sprintf("-dLastPage=%d", pageNum)
 
+    // convert to three sizes: small, normal, and large
+    smallJPEGPathForPage := fmt.Sprintf(smallJPEGPath, pageNum)
     jpegPathForPage := fmt.Sprintf(jpegPath, pageNum)
-    outputFileOption := fmt.Sprintf("-sOutputFile=%s", jpegPathForPage)
+    largeJPEGPathForPage := fmt.Sprintf(largeJPEGPath, pageNum)
+
+    outputFileOption := fmt.Sprintf("-sOutputFile=%s", largeJPEGPathForPage)
 
     cmd := exec.Command("gs", "-dNOPAUSE", "-sDEVICE=jpeg", firstPageOption,
       lastPageOption, outputFileOption, "-dJPEGQ=90", "-r300", "-q", pdfPath,
       "-c", "quit")
-    cmd.Run()
+    err := cmd.Run()
+
+    if err != nil {
+      fmt.Printf("gs command failed: %s\n", err.Error())
+      return
+    }
+
+    // resize large JPEG to normal size
+    cmd = exec.Command("epeg", "-m", "800", largeJPEGPathForPage,
+      jpegPathForPage)
+    err = cmd.Run()
+
+    if err != nil {
+      fmt.Printf("epeg command failed: %s\n", err.Error())
+      return
+    }
+
+    // resize large JPEG to small size
+    cmd = exec.Command("epeg", "-m", "300", largeJPEGPathForPage,
+      smallJPEGPathForPage)
+    err = cmd.Run()
+
+    if err != nil {
+      fmt.Printf("epeg command failed: %s\n", err.Error())
+      return
+    }
   }
+}
+
+/* Converts the PDF at `pdfPath` to JPEGs. Outputs the JPEGs to the provided
+ * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
+ * number). Returns the path to the JPEGs (contains a %d that should be
+ * replaced with the page number) and the number of pages in the PDF. */
+func convertPDFToJPEGs(pdfPath string, jpegPath string) (int, error) {
+  numPages, err := getNumPages(pdfPath)
+  if err != nil { return -1, err }
+
+  // find number of pages to convert per worker
+  numPagesPerWorkerFloat64 := float64(numPages) / float64(NUM_WORKERS_CONVERT)
+  numPagesPerWorker := int(math.Ceil(numPagesPerWorkerFloat64))
+
+  var wg sync.WaitGroup
+
+  for firstPage := 1; firstPage <= numPages;
+      firstPage = firstPage + numPagesPerWorker {
+    // spawn workers, keeping track of them to wait until they're finished
+    wg.Add(1)
+    lastPage := firstPage + numPagesPerWorker - 1
+    if lastPage > numPages {
+      lastPage = numPages
+    }
+
+    go convertPagesToJPEGs(&wg, pdfPath, jpegPath, firstPage, lastPage)
+  }
+
+  wg.Wait()
+  return numPages, err
 }
 
 /* Generates and returns a random string of the given length. */
@@ -161,37 +245,6 @@ func generateRandomString(length int) string {
   }
 
   return string(bytes)
-}
-
-/* Converts the PDF at `pdfPath` to JPEGs. Outputs the JPEGs to the provided
- * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
- * number). Returns the path to the JPEGs (contains a %d that should be
- * replaced with the page number) and the number of pages in the PDF. */
-func convertPDFToJPEGs(pdfPath string, jpegPath string) (int, error) {
-  numPages, err := getNumPages(pdfPath)
-  if err != nil { return -1, err }
-
-  fmt.Printf("Got PDF with num pages %d\n", numPages)
-
-  // find number of pages to convert per worker
-  numPagesPerWorkerFloat64 := float64(numPages) / float64(NUM_WORKERS_CONVERT)
-  numPagesPerWorker := int(math.Ceil(numPagesPerWorkerFloat64))
-
-  var wg sync.WaitGroup
-  for firstPage := 1; firstPage <= numPages;
-      firstPage = firstPage + numPagesPerWorker {
-    // spawn workers, keeping track of them to wait until they're finished
-    wg.Add(1)
-    lastPage := firstPage + numPagesPerWorker - 1
-    if lastPage > numPages {
-      lastPage = numPages
-    }
-
-    go convertPagesToJPEGs(&wg, pdfPath, jpegPath, firstPage, lastPage)
-  }
-
-  wg.Wait()
-  return numPages, nil
 }
 
 /* Finds the PDF the user would like to convert. Downloads it to a temporary
