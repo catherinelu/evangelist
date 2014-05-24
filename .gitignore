@@ -1,0 +1,4 @@
+*.sw[pon]
+.DS_Store
+.vagrant
+Vagrantfile
