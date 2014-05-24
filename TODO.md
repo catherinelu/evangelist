@@ -1,0 +1,4 @@
+- Add requirements files for go packages and system packages (or document them)
+- Figure out how to authenticate with and communicate to the server securely
+- Write a python adapter for communication
+- Release env.sh and other sensitive files on safe
