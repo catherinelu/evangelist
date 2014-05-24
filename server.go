@@ -20,7 +20,10 @@ import (
 const MAX_MULTIPART_FORM_BYTES = 1024 * 1024;
 
 // number of workers to run simultaneously to convert a PDF
-const NUM_WORKERS = 2;
+const NUM_WORKERS_CONVERT = 2;
+
+// number of workers to run simultaneously to upload a PDF
+const NUM_WORKERS_UPLOAD = 10;
 
 // possible alpha numeric characters
 const ALPHA_NUMERIC = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -53,6 +56,75 @@ func getNumPages(pdfPath string) (int, error) {
   return int(numPagesInt64), nil
 }
 
+/* See the documentation for `uploadAllJPEGsToS3`. This function does the
+ * same, except for a limited range of pages. */
+func uploadJPEGRangeToS3(wg *sync.WaitGroup, bucket *s3.Bucket,
+    jpegPath string, s3JPEGPath string, firstPage int, lastPage int) error {
+  defer wg.Done()
+
+  // upload JPEG corresponding to each page to S3
+  for pageNum := firstPage; pageNum <= lastPage; pageNum = pageNum + 1 {
+    jpegFile, err := os.Open(fmt.Sprintf(jpegPath, pageNum))
+    if err != nil { return err }
+
+    jpegFileInfo, err := jpegFile.Stat()
+    if err != nil { return err }
+
+    remoteJPEGPath := fmt.Sprintf(s3JPEGPath, pageNum)
+    err = bucket.PutReader(remoteJPEGPath, jpegFile, jpegFileInfo.Size(),
+      "image/jpeg", s3.PublicRead)
+    if err != nil { return err }
+  }
+
+  return nil
+}
+
+/* Uploads the JPEGs at the specified `jpegPath` to S3. The S3 name will be
+ * derived from the `s3JPEGPath` argument passed in the provided request. Note
+ * that `jpegPath` and `s3JPEGPath` should both have a %d in it. This will be
+ * replaced with the page number to get the corresponding page's JPEG. */
+func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
+    jpegPath string, numPages int) error {
+  s3JPEGPathSet, ok := request.Form["s3JPEGPath"]
+
+  // ensure user gives us precisely one JPEG path
+  if !ok {
+    err := errors.New("Must specify a JPEG path in the 's3JPEGPath' key.\n")
+    return err
+  }
+
+  if len(s3JPEGPathSet) != 1 {
+    err := errors.New("Must specify exactly one JPEG path in the 's3JPEGPath' key.\n")
+    return err
+  }
+
+  s3JPEGPath := request.Form["s3JPEGPath"][0]
+  if !strings.Contains(s3JPEGPath, "%d") {
+    err := errors.New("Must specify a JPEG path with %d in the 's3JPEGPath' key.\n")
+    return err
+  }
+
+  // find number of pages to upload per worker
+  numPagesPerWorkerFloat64 := float64(numPages) / float64(NUM_WORKERS_UPLOAD)
+  numPagesPerWorker := int(math.Ceil(numPagesPerWorkerFloat64))
+
+  var wg sync.WaitGroup
+  for firstPage := 1; firstPage <= numPages;
+      firstPage = firstPage + numPagesPerWorker {
+    // spawn workers, keeping track of them to wait until they're finished
+    wg.Add(1)
+    lastPage := firstPage + numPagesPerWorker - 1
+    if lastPage > numPages {
+      lastPage = numPages
+    }
+
+    go uploadJPEGRangeToS3(&wg, bucket, jpegPath, s3JPEGPath, firstPage, lastPage)
+  }
+
+  wg.Wait()
+  return nil
+}
+
 /* Converts the PDF at `pdfPath` to JPEGs. Outputs the JPEGs to the provided
  * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
  * number). Converts pages within the range [`firstPage`, `lastPage`]. Calls
@@ -61,15 +133,20 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
     firstPage int, lastPage int) {
   defer wg.Done()
 
-  outputFileOption := fmt.Sprintf("-sOutputFile=%s", jpegPath)
-  firstPageOption := fmt.Sprintf("-dFirstPage=%d", firstPage)
-  lastPageOption := fmt.Sprintf("-dLastPage=%d", lastPage)
-
   // use ghostscript for PDF -> JPEG conversion at 300 density
-  cmd := exec.Command("gs", "-dNOPAUSE", "-sDEVICE=jpeg", firstPageOption,
-    lastPageOption, outputFileOption, "-dJPEGQ=90", "-r300", "-q", pdfPath,
-    "-c", "quit")
-  cmd.Run()
+  for pageNum := firstPage; pageNum <= lastPage; pageNum = pageNum + 1 {
+    // convert a single page at a time with the correct output JPEG path
+    firstPageOption := fmt.Sprintf("-dFirstPage=%d", pageNum)
+    lastPageOption := fmt.Sprintf("-dLastPage=%d", pageNum)
+
+    jpegPathForPage := fmt.Sprintf(jpegPath, pageNum)
+    outputFileOption := fmt.Sprintf("-sOutputFile=%s", jpegPathForPage)
+
+    cmd := exec.Command("gs", "-dNOPAUSE", "-sDEVICE=jpeg", firstPageOption,
+      lastPageOption, outputFileOption, "-dJPEGQ=90", "-r300", "-q", pdfPath,
+      "-c", "quit")
+    cmd.Run()
+  }
 }
 
 /* Generates and returns a random string of the given length. */
@@ -88,13 +165,16 @@ func generateRandomString(length int) string {
 
 /* Converts the PDF at `pdfPath` to JPEGs. Outputs the JPEGs to the provided
  * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
- * number). */
-func convertPDFToJPEGs(pdfPath string, jpegPath string) error {
+ * number). Returns the path to the JPEGs (contains a %d that should be
+ * replaced with the page number) and the number of pages in the PDF. */
+func convertPDFToJPEGs(pdfPath string, jpegPath string) (int, error) {
   numPages, err := getNumPages(pdfPath)
-  if err != nil { return err }
+  if err != nil { return -1, err }
+
+  fmt.Printf("Got PDF with num pages %d\n", numPages)
 
   // find number of pages to convert per worker
-  numPagesPerWorkerFloat64 := float64(numPages) / float64(NUM_WORKERS)
+  numPagesPerWorkerFloat64 := float64(numPages) / float64(NUM_WORKERS_CONVERT)
   numPagesPerWorker := int(math.Ceil(numPagesPerWorkerFloat64))
 
   var wg sync.WaitGroup
@@ -107,12 +187,11 @@ func convertPDFToJPEGs(pdfPath string, jpegPath string) error {
       lastPage = numPages
     }
 
-    go convertPagesToJPEGs(&wg, pdfPath, "/tmp/pages/page%d.jpg",
-      firstPage, lastPage)
+    go convertPagesToJPEGs(&wg, pdfPath, jpegPath, firstPage, lastPage)
   }
 
   wg.Wait()
-  return nil
+  return numPages, nil
 }
 
 /* Finds the PDF the user would like to convert. Downloads it to a temporary
@@ -121,22 +200,21 @@ func fetchPDF(request *http.Request, bucket *s3.Bucket) (string, error) {
   err := request.ParseMultipartForm(MAX_MULTIPART_FORM_BYTES)
   if err != nil { return "", err }
 
-  s3PDFPathSet, ok := request.Form["pdf"]
+  s3PDFPathSet, ok := request.Form["s3PDFPath"]
 
   // ensure user gives us precisely one PDF to convert
   if !ok {
-    err = errors.New("Must specify a PDF to convert in the 'pdf' key.\n")
+    err = errors.New("Must specify a PDF to convert in the 's3PDFPath' key.\n")
     return "", err
   }
 
   if len(s3PDFPathSet) != 1 {
-    err = errors.New("Must specify exactly one S3 PDF path in 'pdf' key.\n")
+    err = errors.New("Must specify exactly one S3 PDF path in 's3PDFPath' key.\n")
     return "", err
   }
 
   // find PDF in S3
-  s3PDFPath := request.Form["pdf"][0]
-  fmt.Printf("Accessing bucket %s\n", s3PDFPath)
+  s3PDFPath := request.Form["s3PDFPath"][0]
   reader, err := bucket.GetReader(s3PDFPath)
 
   if err != nil { return "", err }
@@ -144,7 +222,6 @@ func fetchPDF(request *http.Request, bucket *s3.Bucket) (string, error) {
 
   // copy multipart data into temporary file for processing
   pdfPath := "/tmp/" + generateRandomString(50) + ".pdf"
-  fmt.Printf("PDF path is %s\n", pdfPath)
   pdf, err := os.Create(pdfPath)
 
   if err != nil { return "", err }
@@ -191,10 +268,13 @@ func convert(writer http.ResponseWriter, request *http.Request) {
   pdfPath, err := fetchPDF(request, bucket)
   if handleError(err, writer) { return }
 
-  pdf, err := os.Open(pdfPath)
+  // put JPEGs in tmp folder under random prefix
+  jpegPath := fmt.Sprintf("/tmp/%s%%d.jpg", generateRandomString(50));
+
+  numPages, err := convertPDFToJPEGs(pdfPath, jpegPath)
   if handleError(err, writer) { return }
 
-  err = convertPDFToJPEGs(pdf.Name(), "/tmp/pages/page%d.jpg")
+  err = uploadAllJPEGsToS3(bucket, request, jpegPath, numPages)
   if handleError(err, writer) { return }
 
   fmt.Printf("Conversion finished\n")
