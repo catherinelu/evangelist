@@ -1,3 +1,5 @@
+#!/bin/bash
+
 NAME="evangelist"                    # Name of the application
 DIRECTORY="/home/deploy/evangelist"  # Location of application
 USER=deploy                          # User to run as
