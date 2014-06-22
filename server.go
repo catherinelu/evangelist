@@ -77,13 +77,17 @@ func uploadJPEGToS3(bucket *s3.Bucket, jpegPath string, s3JPEGPath string,
 /* See the documentation for `uploadAllJPEGsToS3`. This function does the
  * same, except for a limited range of pages. */
 func uploadJPEGRangeToS3(wg *sync.WaitGroup, bucket *s3.Bucket,
-    jpegPath string, largeJPEGPath string, s3JPEGPath string,
-    s3LargeJPEGPath string, firstPage int, lastPage int) error {
+    jpegPath string, smallJPEGPath string, largeJPEGPath string,
+    s3JPEGPath string, s3SmallJPEGPath string, s3LargeJPEGPath string,
+    firstPage int, lastPage int) error {
   defer wg.Done()
 
   // upload JPEGs (normal, and large) corresponding to each page to S3
   for pageNum := firstPage; pageNum <= lastPage; pageNum = pageNum + 1 {
     err := uploadJPEGToS3(bucket, jpegPath, s3JPEGPath, pageNum)
+    if err != nil { return err }
+
+    err = uploadJPEGToS3(bucket, smallJPEGPath, s3SmallJPEGPath, pageNum)
     if err != nil { return err }
 
     err = uploadJPEGToS3(bucket, largeJPEGPath, s3LargeJPEGPath, pageNum)
@@ -99,13 +103,21 @@ func uploadJPEGRangeToS3(wg *sync.WaitGroup, bucket *s3.Bucket,
  * should have '%d' in them. This will be replaced with the page number to get
  * the corresponding page's JPEG. */
 func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
-    jpegPath string, largeJPEGPath string, numPages int) error {
+    jpegPath string, smallJPEGPath string, largeJPEGPath string,
+    numPages int) error {
   s3JPEGPathSet, okJPEGPath := request.Form["s3JPEGPath"]
+  s3SmallJPEGPathSet, okSmallJPEGPath := request.Form["s3SmallJPEGPath"]
   s3LargeJPEGPathSet, okLargeJPEGPath := request.Form["s3LargeJPEGPath"]
 
   // ensure user gives us precisely one normal JPEG and one large JPEG path
   if !okJPEGPath {
     err := errors.New("Must specify a JPEG path in the 's3JPEGPath' key.\n")
+    return err
+  }
+
+  if !okSmallJPEGPath {
+    err := errors.New("Must specify a small JPEG path in the " +
+      "'s3SmallJPEGPath' key.\n")
     return err
   }
 
@@ -118,6 +130,12 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
   if len(s3JPEGPathSet) != 1 {
     err := errors.New("Must specify exactly one JPEG path in the " +
       "'s3JPEGPath' key.\n")
+    return err
+  }
+
+  if len(s3SmallJPEGPathSet) != 1 {
+    err := errors.New("Must specify exactly one JPEG path in the " +
+      "'s3SmallJPEGPath' key.\n")
     return err
   }
 
@@ -134,8 +152,15 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
     return err
   }
 
+  s3SmallJPEGPath := request.Form["s3SmallJPEGPath"][0]
+  if !strings.Contains(s3SmallJPEGPath, "%d") {
+    err := errors.New("Must specify a JPEG path with %d in the " +
+      "'s3SmallJPEGPath' key.\n")
+    return err
+  }
+
   s3LargeJPEGPath := request.Form["s3LargeJPEGPath"][0]
-  if !strings.Contains(s3JPEGPath, "%d") {
+  if !strings.Contains(s3LargeJPEGPath, "%d") {
     err := errors.New("Must specify a JPEG path with %d in the " +
       "'s3LargeJPEGPath' key.\n")
     return err
@@ -155,8 +180,8 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
       lastPage = numPages
     }
 
-    go uploadJPEGRangeToS3(&wg, bucket, jpegPath, largeJPEGPath, s3JPEGPath,
-      s3LargeJPEGPath, firstPage, lastPage)
+    go uploadJPEGRangeToS3(&wg, bucket, jpegPath, smallJPEGPath, largeJPEGPath,
+      s3JPEGPath, s3SmallJPEGPath, s3LargeJPEGPath, firstPage, lastPage)
   }
 
   wg.Wait()
@@ -168,7 +193,7 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
  * number). Converts pages within the range [`firstPage`, `lastPage`]. Calls
  * `wg.Done()` once finished. Returns an error on the given channel. */
 func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
-    largeJPEGPath string, firstPage int, lastPage int) {
+    smallJPEGPath string, largeJPEGPath string, firstPage int, lastPage int) {
   defer wg.Done()
 
   // use ghostscript for PDF -> JPEG conversion at 300 density
@@ -179,7 +204,9 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
 
     // convert to two sizes: normal and large
     jpegPathForPage := fmt.Sprintf(jpegPath, pageNum)
+    smallJPEGPathForPage := fmt.Sprintf(smallJPEGPath, pageNum)
     largeJPEGPathForPage := fmt.Sprintf(largeJPEGPath, pageNum)
+
     outputFileOption := fmt.Sprintf("-sOutputFile=%s", largeJPEGPathForPage)
 
     cmd := exec.Command("gs", "-dNOPAUSE", "-sDEVICE=jpeg", firstPageOption,
@@ -201,6 +228,16 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
       fmt.Printf("epeg command failed: %s\n", err.Error())
       return
     }
+
+    // resize large JPEG to small size
+    cmd = exec.Command("epeg", "-m", "300", largeJPEGPathForPage,
+      smallJPEGPathForPage)
+    err = cmd.Run()
+
+    if err != nil {
+      fmt.Printf("epeg command failed: %s\n", err.Error())
+      return
+    }
   }
 }
 
@@ -208,7 +245,7 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
  * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
  * number). Returns the path to the JPEGs (contains a %d that should be
  * replaced with the page number) and the number of pages in the PDF. */
-func convertPDFToJPEGs(pdfPath string, jpegPath string,
+func convertPDFToJPEGs(pdfPath string, jpegPath string, smallJPEGPath string,
     largeJPEGPath string) (int, error) {
   numPages, err := getNumPages(pdfPath)
   if err != nil { return -1, err }
@@ -228,8 +265,8 @@ func convertPDFToJPEGs(pdfPath string, jpegPath string,
       lastPage = numPages
     }
 
-    go convertPagesToJPEGs(&wg, pdfPath, jpegPath, largeJPEGPath, firstPage,
-      lastPage)
+    go convertPagesToJPEGs(&wg, pdfPath, jpegPath, smallJPEGPath,
+      largeJPEGPath, firstPage, lastPage)
   }
 
   wg.Wait()
@@ -327,12 +364,15 @@ func convert(writer http.ResponseWriter, request *http.Request) {
   // put JPEGs in tmp folder under random prefix
   jpegPrefix := generateRandomString(50);
   jpegPath := fmt.Sprintf("/tmp/%s%%d.jpg", jpegPrefix);
+  smallJPEGPath := fmt.Sprintf("/tmp/%s%%d-small.jpg", jpegPrefix);
   largeJPEGPath := fmt.Sprintf("/tmp/%s%%d-large.jpg", jpegPrefix);
 
-  numPages, err := convertPDFToJPEGs(pdfPath, jpegPath, largeJPEGPath)
+  numPages, err := convertPDFToJPEGs(pdfPath, jpegPath, smallJPEGPath,
+    largeJPEGPath)
   if handleError(err, writer) { return }
 
-  err = uploadAllJPEGsToS3(bucket, request, jpegPath, largeJPEGPath, numPages)
+  err = uploadAllJPEGsToS3(bucket, request, jpegPath, smallJPEGPath,
+    largeJPEGPath, numPages)
   if handleError(err, writer) { return }
 
   fmt.Printf("Conversion finished\n")
