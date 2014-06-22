@@ -2,3 +2,5 @@
 .DS_Store
 .vagrant
 Vagrantfile
+env.sh
+epeg
