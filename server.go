@@ -12,6 +12,7 @@ import (
   "math"
   "errors"
   "crypto/rand"
+  "path/filepath"
   "launchpad.net/goamz/aws"
   "launchpad.net/goamz/s3"
 )
@@ -327,13 +328,13 @@ func fetchPDF(request *http.Request, bucket *s3.Bucket) (string, error) {
 }
 
 /* Returns an S3 connection to the given bucket. */
-func connectToS3(bucketName string) (*s3.Bucket, error) {
+func connectToS3(bucketName string, region aws.Region) (*s3.Bucket, error) {
   auth, err := aws.EnvAuth()
   if err != nil { return nil, err }
 
   // connect to S3 bucket
   var bucket *s3.Bucket = nil
-  conn := s3.New(auth, aws.USEast)
+  conn := s3.New(auth, region)
 
   if conn != nil {
     bucket = conn.Bucket(bucketName)
@@ -349,13 +350,14 @@ func connectToS3(bucketName string) (*s3.Bucket, error) {
 
 /* Converts the PDF in the given multipart request to a set of JPEGs. Uploads
  * the JPEGs to S3. */
-func convert(writer http.ResponseWriter, request *http.Request) {
+func convert(writer http.ResponseWriter, request *http.Request,
+    bucketName string, regionName string) {
   if request.Method != "POST" {
     fmt.Fprintf(writer, "Only POST requests are supported.\n")
     return
   }
 
-  bucket, err := connectToS3("scoryst-demo")
+  bucket, err := connectToS3(bucketName, aws.Regions[regionName])
   if handleError(err, writer) { return }
 
   pdfPath, err := fetchPDF(request, bucket)
@@ -384,6 +386,18 @@ func main() {
   socket := "0.0.0.0:7000"
   fmt.Printf("Serving on %s\n", socket)
 
-  http.HandleFunc("/", convert)
+  // must have three arguments: file path, bucket name, and region name
+  if len(os.Args) != 3 {
+    baseName := filepath.Base(os.Args[0])
+    fmt.Printf("Usage: %s [bucketName] [regionName]\n", baseName)
+    os.Exit(1)
+  }
+
+  bucketName := os.Args[1]
+  regionName := os.Args[2]
+
+  http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+    convert(writer, request, bucketName, regionName)
+  })
   http.ListenAndServe(socket, nil)
 }
