@@ -8,4 +8,4 @@ echo "Starting $NAME as `whoami`"
 cd $DIRECTORY
 . ~/.bash_profile
 source env.sh
-go run server.go
+go run server.go scoryst us-west-2
