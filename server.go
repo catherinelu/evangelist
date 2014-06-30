@@ -189,6 +189,16 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
   return nil
 }
 
+/* Resizes the JPEG at `jpegPath` to have a width at most `maxWidth` and
+ * a height at most `maxHeight`. Maintains aspect ratio. Saves the resized 
+ * JPEG to `resizedJPEGPath`. */
+func resizeAndSaveImage(jpegPath string, resizedJPEGPath string, maxWidth int,
+    maxHeight int) error {
+  dimension := fmt.Sprintf("%dx%d", maxWidth, maxHeight)
+  cmd := exec.Command("convert", "-resize", dimension, jpegPath, resizedJPEGPath)
+  return cmd.Run()
+}
+
 /* Converts the PDF at `pdfPath` to JPEGs. Outputs the JPEGs to the provided
  * `jpegPath` (note: '%d' in `jpegPath` will be replaced by the JPEG
  * number). Converts pages within the range [`firstPage`, `lastPage`]. Calls
@@ -220,23 +230,15 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
       return
     }
 
-    // resize large JPEG to normal size
-    cmd = exec.Command("epeg", "-m", "800", largeJPEGPathForPage,
-      jpegPathForPage)
-    err = cmd.Run()
-
+    resizeAndSaveImage(largeJPEGPathForPage, jpegPathForPage, 800, 800)
     if err != nil {
-      fmt.Printf("epeg command failed: %s\n", err.Error())
+      fmt.Printf("Couldn't resize image: %s\n", err.Error())
       return
     }
 
-    // resize large JPEG to small size
-    cmd = exec.Command("epeg", "-m", "300", largeJPEGPathForPage,
-      smallJPEGPathForPage)
-    err = cmd.Run()
-
+    resizeAndSaveImage(jpegPathForPage, smallJPEGPathForPage, 300, 300)
     if err != nil {
-      fmt.Printf("epeg command failed: %s\n", err.Error())
+      fmt.Printf("Couldn't resize image: %s\n", err.Error())
       return
     }
   }
