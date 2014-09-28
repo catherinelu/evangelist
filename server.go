@@ -190,7 +190,7 @@ func uploadAllJPEGsToS3(bucket *s3.Bucket, request *http.Request,
 }
 
 /* Resizes the JPEG at `jpegPath` to have a width at most `maxWidth` and
- * a height at most `maxHeight`. Maintains aspect ratio. Saves the resized 
+ * a height at most `maxHeight`. Maintains aspect ratio. Saves the resized
  * JPEG to `resizedJPEGPath`. */
 func resizeAndSaveImage(jpegPath string, resizedJPEGPath string, maxWidth int,
     maxHeight int) error {
@@ -221,7 +221,7 @@ func convertPagesToJPEGs(wg *sync.WaitGroup, pdfPath string, jpegPath string,
     outputFileOption := fmt.Sprintf("-sOutputFile=%s", largeJPEGPathForPage)
 
     cmd := exec.Command("gs", "-dNOPAUSE", "-sDEVICE=jpeg", firstPageOption,
-      lastPageOption, outputFileOption, "-dJPEGQ=90", "-r300", "-q", pdfPath,
+      lastPageOption, outputFileOption, "-dJPEGQ=90", "-r200", "-q", pdfPath,
       "-c", "quit")
     err := cmd.Run()
 
